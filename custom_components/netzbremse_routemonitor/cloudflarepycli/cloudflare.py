@@ -6,6 +6,7 @@ This uses endpoints from speed.cloudflare.com.
 
 from __future__ import annotations
 
+import logging
 import statistics
 import time
 from enum import Enum
@@ -77,10 +78,11 @@ class TestTimers(NamedTuple):
     def to_speeds(self, test: TestSpec) -> list[int]:
         """Compute the test speeds in bits per second from its type and size."""
         if test.type == TestType.Up:
-            return [int(test.bits / server_time) for server_time in self.server]
+            return [int(test.bits / server_time) for server_time in self.server if server_time > 0]
         return [
             int(test.bits / (full_time - server_time))
             for full_time, server_time in zip(self.full, self.server, strict=False)
+            if (full_time - server_time) > 0
         ]
 
     def to_latencies(self) -> list[float]:
@@ -127,6 +129,43 @@ def _with_units(base_label: str, value: float, *, megabits: bool) -> tuple[str, 
     if megabits:
         value = round(value / 1e6, 2)
     return (f"{base_label}_{suffix}", TestResult(value))
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _parse_server_timing(header_value: str) -> float:
+    rtt_fallback: float | None = None
+    for entry in header_value.split(","):
+        for param in entry.strip().split(";"):
+            param = param.strip()
+            if param.startswith("dur="):
+                try:
+                    return float(param[4:])
+                except ValueError:
+                    pass
+            if rtt_fallback is None and param.startswith('desc="'):
+                _rtt = _extract_rtt_from_desc(param[6:].rstrip('"'))
+                if _rtt is not None:
+                    rtt_fallback = _rtt
+    if rtt_fallback is not None:
+        _LOGGER.debug("Using rtt=%.2f ms from cfL4 desc as server_time proxy", rtt_fallback)
+        return rtt_fallback
+    _LOGGER.warning(
+        "Could not extract server_time from Server-Timing header (no dur= or rtt= found): %r",
+        header_value,
+    )
+    return 0.0
+
+
+def _extract_rtt_from_desc(desc_value: str) -> float | None:
+    for part in desc_value.split("&"):
+        if part.startswith("rtt="):
+            try:
+                return float(part[4:]) / 1e3
+            except ValueError:
+                pass
+    return None
 
 
 SuiteResults = dict[str, dict[str, TestResult]]
@@ -193,7 +232,7 @@ class CloudflareSpeedtest:
             start = time.time()
             r = await self.session.request(test.type.value, url, content=data, timeout=self.timeout)
             coll.full.append(time.time() - start)
-            coll.server.append(float(r.headers["Server-Timing"].split("=")[1].split(",")[0]) / 1e3)
+            coll.server.append(_parse_server_timing(r.headers.get("Server-Timing", "")) / 1e3)
             coll.request.append(r.elapsed.total_seconds())
         return coll
 
