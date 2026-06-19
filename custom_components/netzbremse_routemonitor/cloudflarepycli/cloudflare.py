@@ -129,6 +129,18 @@ def _with_units(base_label: str, value: float, *, megabits: bool) -> tuple[str, 
     return (f"{base_label}_{suffix}", TestResult(value))
 
 
+def _parse_server_timing(header_value: str) -> float:
+    for entry in header_value.split(","):
+        for param in entry.strip().split(";"):
+            param = param.strip()
+            if param.startswith("dur="):
+                try:
+                    return float(param[4:])
+                except ValueError:
+                    pass
+    return 0.0
+
+
 SuiteResults = dict[str, dict[str, TestResult]]
 
 
@@ -193,7 +205,7 @@ class CloudflareSpeedtest:
             start = time.time()
             r = await self.session.request(test.type.value, url, content=data, timeout=self.timeout)
             coll.full.append(time.time() - start)
-            coll.server.append(float(r.headers["Server-Timing"].split("=")[1].split(",")[0]) / 1e3)
+            coll.server.append(_parse_server_timing(r.headers.get("Server-Timing", "")) / 1e3)
             coll.request.append(r.elapsed.total_seconds())
         return coll
 
